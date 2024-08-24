@@ -1,8 +1,19 @@
 use sqlx::postgres::PgPoolOptions;
-use zero2prod::{configuration::get_configuration, startup::run};
+use zero2prod::{
+    configuration::get_configuration,
+    startup::run,
+    telemetry::{get_subscriber, init_subscriber},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
+    let subscriber = get_subscriber(
+        "zero2prod".into(),
+        "info,tower_http=debug,axum::rejection=trace".into(),
+        std::io::stdout,
+    );
+    init_subscriber(subscriber);
+
     // Panic if we can't read config
     let configuration = get_configuration().expect("Failed to read config.");
     let connection = PgPoolOptions::new()
