@@ -1,3 +1,4 @@
+use secrecy::ExposeSecret;
 use sqlx::postgres::PgPoolOptions;
 use zero2prod::{
     configuration::get_configuration,
@@ -18,7 +19,7 @@ async fn main() -> Result<(), std::io::Error> {
     let configuration = get_configuration().expect("Failed to read config.");
     let connection = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&configuration.database.connection_string())
+        .connect(&configuration.database.connection_string().expose_secret())
         .await
         .expect("Failed to connect to Postgres.");
     let address = format!("127.0.0.1:{}", configuration.application_port);

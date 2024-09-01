@@ -15,6 +15,7 @@ axum = "0.7.5"
 chrono = { version = "0.4.38", default-features = false, features = ["clock"] }
 config = "0.14.0"
 reqwest = "0.12.5"
+secrecy = { version = "0.8.0", features = ["serde"] }
 serde = { version = "1.0.208", features = ["derive"] }
 tokio = { version = "1.39.2", features = ["rt-multi-thread"] }
 tower-http = { version = "0.5.2", features = ["trace"] }
