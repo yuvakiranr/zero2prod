@@ -5,10 +5,14 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Pool, Postgres};
 use uuid::Uuid;
 
-use crate::domain::{NewSubscriber, SubscriberEmail, SubscriberName};
+use crate::{
+    domain::{NewSubscriber, SubscriberEmail, SubscriberName},
+    email_client::EmailClient,
+    startup::ApplicationBaseUrl,
+};
 
 #[derive(Deserialize)]
 pub struct FormData {
@@ -34,14 +38,16 @@ pub fn parse_subscriber(form: FormData) -> Result<NewSubscriber, String> {
 
 #[tracing::instrument(
     name = "Adding a new subscriber",
-    skip(form, connection),
+    skip(form, db_connection, email_client, base_url),
     fields(
         subscriber_email = %form.email,
         subscriber_name = %form.name
     )
 )]
 pub async fn subscribe(
-    State(connection): State<PgPool>,
+    State(base_url): State<ApplicationBaseUrl>,
+    State(email_client): State<EmailClient>,
+    State(db_connection): State<Pool<Postgres>>,
     Form(form): Form<FormData>,
 ) -> impl IntoResponse {
     let new_subscriber = match form.try_into() {
@@ -49,10 +55,21 @@ pub async fn subscribe(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    match insert_subscriber(&connection, &new_subscriber).await {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    if insert_subscriber(&db_connection, &new_subscriber)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR;
     }
+
+    if send_confirmation_email(&email_client, new_subscriber, base_url)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    StatusCode::OK
 }
 
 #[tracing::instrument(
@@ -65,13 +82,13 @@ pub async fn insert_subscriber(
 ) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"
-        INSERT INTO subscriptions (id, email, name, subscribed_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO subscriptions (id, email, name, subscribed_at, status)
+        VALUES ($1, $2, $3, $4, 'pending_confirmation')
         "#,
         Uuid::new_v4(),
         new_subscriber.email.as_ref(),
         new_subscriber.name.as_ref(),
-        Utc::now()
+        Utc::now(),
     )
     .execute(pool)
     .await
@@ -80,4 +97,32 @@ pub async fn insert_subscriber(
         err
     })?;
     Ok(())
+}
+
+#[tracing::instrument(
+    name = "Send a confirmation email to a new subscriber",
+    skip(email_client, new_subscriber)
+)]
+pub async fn send_confirmation_email(
+    email_client: &EmailClient,
+    new_subscriber: NewSubscriber,
+    ApplicationBaseUrl(base_url): ApplicationBaseUrl,
+) -> Result<(), reqwest::Error> {
+    let confirmation_link = format!(
+        "{}/subscriptions/confirm?subscription_token=mytoken",
+        base_url
+    );
+    let plain_body = format!(
+        "Welcome to our newsletter!\nVisit {} to confirm your subscription.",
+        confirmation_link
+    );
+
+    let html_body = format!(
+        "Welcome to our newsletter!<br />\
+Click <a href=\"{}\">here</a> to confirm your subscription.",
+        confirmation_link
+    );
+    email_client
+        .send_email(new_subscriber.email, "Welcome!", &html_body, &plain_body)
+        .await
 }

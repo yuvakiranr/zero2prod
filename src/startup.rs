@@ -1,11 +1,11 @@
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{FromRef, Request},
     routing::{get, post},
     serve::Serve,
     Router,
 };
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Pool, Postgres};
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -13,12 +13,40 @@ use uuid::Uuid;
 use crate::{
     configuration::{DatabaseSettings, Settings},
     email_client::EmailClient,
-    routes::{health_check, subscribe},
+    routes::{confirm, health_check, subscribe},
 };
 
 pub struct Application {
     port: u16,
     server: Serve<Router, Router>,
+}
+
+#[derive(Clone)]
+pub struct ApplicationBaseUrl(pub String);
+
+#[derive(Clone)]
+pub struct ApplicationState {
+    pub db_connection: Pool<Postgres>,
+    pub email_client: EmailClient,
+    pub base_url: ApplicationBaseUrl,
+}
+
+impl FromRef<ApplicationState> for ApplicationBaseUrl {
+    fn from_ref(input: &ApplicationState) -> Self {
+        input.base_url.clone()
+    }
+}
+
+impl FromRef<ApplicationState> for Pool<Postgres> {
+    fn from_ref(input: &ApplicationState) -> Self {
+        input.db_connection.clone()
+    }
+}
+
+impl FromRef<ApplicationState> for EmailClient {
+    fn from_ref(input: &ApplicationState) -> Self {
+        input.email_client.clone()
+    }
 }
 
 pub fn get_connection_pool(confguration: &DatabaseSettings) -> PgPool {
@@ -48,7 +76,12 @@ impl Application {
         let listener = TcpListener::bind(address).await?;
         let port = listener.local_addr().unwrap().port();
 
-        let server = run(listener, connection_pool, email_client)?;
+        let server = run(
+            listener,
+            connection_pool,
+            email_client,
+            configuration.application.base_url,
+        )?;
 
         Ok(Self { port, server })
     }
@@ -66,10 +99,12 @@ pub fn run(
     listener: TcpListener,
     connection: PgPool,
     email_client: EmailClient,
+    base_url: String,
 ) -> Result<Serve<Router, Router>, std::io::Error> {
     let app = Router::new()
         .route("/health_check", get(health_check))
         .route("/subscriptions", post(subscribe))
+        .route("/subscriptions/confirm", get(confirm))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
                 let request_id = Uuid::new_v4();
@@ -83,8 +118,11 @@ pub fn run(
                 )
             }),
         )
-        .with_state(connection)
-        .with_state(email_client.clone());
+        .with_state(ApplicationState {
+            db_connection: connection,
+            email_client,
+            base_url: ApplicationBaseUrl(base_url),
+        });
 
     let server = axum::serve(listener, app);
 
