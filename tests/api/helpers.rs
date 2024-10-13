@@ -10,7 +10,7 @@ use zero2prod::{
 
 // Ensure that the `tracing` stack is only initialised once using `once_cell`
 static TRACING: Lazy<()> = Lazy::new(|| {
-    let default_filter_level = "debug".into();
+    let default_filter_level = "info".into();
     let subscriber_name = "test".into();
 
     if std::env::var("TEST_LOG").is_ok() {

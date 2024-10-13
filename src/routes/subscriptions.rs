@@ -1,3 +1,5 @@
+use anyhow::Context;
+use axum::response::Response;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -8,6 +10,7 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use serde::Deserialize;
 use sqlx::{Executor, Pool, Postgres, Transaction};
+use std::fmt::Formatter;
 use uuid::Uuid;
 
 use crate::{
@@ -32,12 +35,6 @@ impl TryFrom<FormData> for NewSubscriber {
     }
 }
 
-pub fn parse_subscriber(form: FormData) -> Result<NewSubscriber, String> {
-    let name = SubscriberName::parse(form.name)?;
-    let email = SubscriberEmail::parse(form.email)?;
-    Ok(NewSubscriber { email, name })
-}
-
 #[tracing::instrument(
     name = "Adding a new subscriber",
     skip(form, pool, email_client, base_url),
@@ -51,42 +48,32 @@ pub async fn subscribe(
     State(email_client): State<EmailClient>,
     State(pool): State<Pool<Postgres>>,
     Form(form): Form<FormData>,
-) -> impl IntoResponse {
-    let mut transaction = match pool.begin().await {
-        Ok(transaction) => transaction,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
+) -> Result<impl IntoResponse, SubscribeError> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .context("Failed to acquire a Postgres connection from the pool")?;
+    let new_subscriber = form.try_into()?;
 
-    let new_subscriber = match form.try_into() {
-        Ok(form) => form,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
+    let subscriber_id = insert_subscriber(&mut transaction, &new_subscriber)
+        .await
+        .context("Failed to insert new subscriber in the database.")?;
 
-    let subscriber_id = match insert_subscriber(&mut transaction, &new_subscriber).await {
-        Ok(subscriber_id) => subscriber_id,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
-    };
     let subscription_token = generate_subscriptions_token();
 
-    if store_token(&mut transaction, subscriber_id, &subscription_token)
+    store_token(&mut transaction, subscriber_id, &subscription_token)
         .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
+        .context("Failed to store the confirmation token for a new subscriber.")?;
 
-    if transaction.commit().await.is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    if send_confirmation_email(&email_client, new_subscriber, base_url, &subscription_token)
+    transaction
+        .commit()
         .await
-        .is_err()
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
+        .context("Failed to commit SQL transaction to store a new subscriber.")?;
 
-    StatusCode::OK
+    send_confirmation_email(&email_client, new_subscriber, base_url, &subscription_token)
+        .await
+        .context("Failed to send a confirmation email.")?;
+    Ok(StatusCode::OK)
 }
 
 #[tracing::instrument(
@@ -140,7 +127,7 @@ Click <a href=\"{}\">here</a> to confirm your subscription.",
         confirmation_link
     );
     email_client
-        .send_email(new_subscriber.email, "Welcome!", &html_body, &plain_body)
+        .send_email(&new_subscriber.email, "Welcome!", &html_body, &plain_body)
         .await
 }
 
@@ -172,4 +159,47 @@ pub async fn store_token(
         e
     })?;
     Ok(())
+}
+
+pub fn error_chain_format(
+    e: &impl std::error::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    writeln!(f, "{}\n", e)?;
+    let mut current = e.source();
+    while let Some(cause) = current {
+        writeln!(f, "Caused by:\n\t{}", cause)?;
+        current = cause.source();
+    }
+    Ok(())
+}
+
+#[derive(thiserror::Error)]
+pub enum SubscribeError {
+    #[error("{0}")]
+    ValidationError(String),
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
+}
+
+impl From<String> for SubscribeError {
+    fn from(value: String) -> Self {
+        Self::ValidationError(value)
+    }
+}
+
+impl std::fmt::Debug for SubscribeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        error_chain_format(self, f)
+    }
+}
+
+impl IntoResponse for SubscribeError {
+    fn into_response(self) -> Response {
+        let status_code = match self {
+            SubscribeError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            SubscribeError::UnexpectedError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        status_code.into_response()
+    }
 }
